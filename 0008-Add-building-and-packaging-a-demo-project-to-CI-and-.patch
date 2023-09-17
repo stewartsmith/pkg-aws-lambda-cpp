@@ -1,0 +1,159 @@
+From c09c86e0268ab8965ebd0ebee142c69c655a3207 Mon Sep 17 00:00:00 2001
+From: Krzysiek Karbowiak <krzysztof.karbowiak@interia.pl>
+Date: Mon, 27 Feb 2023 05:45:06 +0100
+Subject: [PATCH 8/9] Add building and packaging a demo project to CI and
+ revert #136 (#183)
+
+* Add demo project
+
+* Add build-demo CI job
+
+* Revert "Simplified method for picking out shared libraries from system package query result (#136)"
+
+This reverts commit 5fb60b9d93c685e15d036889eb992dabe296d0bc.
+
+---------
+
+Co-authored-by: Bryan Moffatt <bmoffatt@users.noreply.github.com>
+Co-authored-by: Bryan Moffatt <bryan@bryanmoffatt.com>
+---
+ .github/workflows/workflow.yml | 22 ++++++++++++++++++++++
+ examples/demo/CMakeLists.txt   | 11 +++++++++++
+ examples/demo/main.cpp         | 20 ++++++++++++++++++++
+ packaging/packager             | 17 ++++++++++++-----
+ 4 files changed, 65 insertions(+), 5 deletions(-)
+ create mode 100644 examples/demo/CMakeLists.txt
+ create mode 100644 examples/demo/main.cpp
+
+diff --git a/.github/workflows/workflow.yml b/.github/workflows/workflow.yml
+index 5cadaf0..526b38a 100644
+--- a/.github/workflows/workflow.yml
++++ b/.github/workflows/workflow.yml
+@@ -46,6 +46,28 @@ jobs:
+           cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_CXX_CLANG_TIDY=clang-tidy
+           cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+ 
++  build-demo:
++    runs-on: ubuntu-latest
++    steps:
++    - uses: actions/checkout@v3
++
++    - name: Install Dependencies
++      run: sudo apt-get update && sudo apt-get install -y clang-tidy libcurl4-openssl-dev
++
++    - name: Build and install lambda runtime
++      run: |
++        mkdir build && cd build
++        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=~/lambda-install
++        make
++        make install
++
++    - name: Build and package demo project
++      run: |
++        cd examples/demo
++        mkdir build && cd build
++        cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=~/lambda-install
++        make
++        make aws-lambda-package-demo
+   
+   
+   format:
+diff --git a/examples/demo/CMakeLists.txt b/examples/demo/CMakeLists.txt
+new file mode 100644
+index 0000000..06aad51
+--- /dev/null
++++ b/examples/demo/CMakeLists.txt
+@@ -0,0 +1,11 @@
++cmake_minimum_required(VERSION 3.9)
++set(CMAKE_CXX_STANDARD 11)
++project(demo LANGUAGES CXX)
++find_package(aws-lambda-runtime)
++add_executable(${PROJECT_NAME} "main.cpp")
++target_link_libraries(${PROJECT_NAME} PRIVATE AWS::aws-lambda-runtime)
++target_compile_features(${PROJECT_NAME} PRIVATE "cxx_std_11")
++target_compile_options(${PROJECT_NAME} PRIVATE "-Wall" "-Wextra")
++
++# this line creates a target that packages your binary and zips it up
++aws_lambda_package_target(${PROJECT_NAME})
+diff --git a/examples/demo/main.cpp b/examples/demo/main.cpp
+new file mode 100644
+index 0000000..358efe0
+--- /dev/null
++++ b/examples/demo/main.cpp
+@@ -0,0 +1,20 @@
++#include <aws/lambda-runtime/runtime.h>
++
++using namespace aws::lambda_runtime;
++
++static invocation_response my_handler(invocation_request const& req)
++{
++    if (req.payload.length() > 42) {
++        return invocation_response::failure("error message here"/*error_message*/,
++                                            "error type here" /*error_type*/);
++    }
++
++    return invocation_response::success("json payload here" /*payload*/,
++                                        "application/json" /*MIME type*/);
++}
++
++int main()
++{
++    run_handler(my_handler);
++    return 0;
++}
+diff --git a/packaging/packager b/packaging/packager
+index 4e8759e..0c4e749 100755
+--- a/packaging/packager
++++ b/packaging/packager
+@@ -56,7 +56,7 @@ if ! type zip > /dev/null 2>&1; then
+     exit 1
+ fi
+ 
+-function find_so_files() {
++function pluck_so_files() {
+     sed -E '/\.so$|\.so\.[0-9]+$/!d'
+ }
+ 
+@@ -64,7 +64,7 @@ function package_libc_alpine() {
+     # -F matches a fixed string rather than a regex (grep that comes with busybox doesn't know --fixed-strings)
+     if grep -F "Alpine Linux" < /etc/os-release > /dev/null; then
+         if type apk > /dev/null 2>&1; then
+-            apk info --contents musl 2>/dev/null | find_so_files | sed 's/^/\//'
++            apk info --contents musl 2>/dev/null | pluck_so_files | sed 's/^/\//'
+         fi
+     fi
+ }
+@@ -72,20 +72,27 @@ function package_libc_alpine() {
+ function package_libc_pacman() {
+     if grep --extended-regexp "Arch Linux|Manjaro Linux" < /etc/os-release > /dev/null 2>&1; then
+         if type pacman > /dev/null 2>&1; then
+-            pacman --query --list --quiet glibc | find_so_files
++            pacman --query --list --quiet glibc | pluck_so_files
+         fi
+     fi
+ }
+ 
+ function package_libc_dpkg() {
+     if type dpkg-query > /dev/null 2>&1; then
+-        dpkg-query --listfiles libc6:$(dpkg --print-architecture) | find_so_files
++       architecture=$(dpkg --print-architecture)
++        if [[ $(dpkg-query --listfiles libc6:$architecture | wc -l) -gt 0 ]]; then
++            dpkg-query --listfiles libc6:$architecture | pluck_so_files
++        fi
+     fi
+ }
+ 
+ function package_libc_rpm() {
++    arch=$(uname -m)
++
+     if type rpm > /dev/null 2>&1; then
+-        rpm --query --list glibc.$(uname -m) | find_so_files
++       if [[ $(rpm --query --list glibc.$arch | wc -l) -gt 1 ]]; then
++           rpm --query --list glibc.$arch | pluck_so_files
++       fi
+     fi
+ }
+ 
+-- 
+2.41.0
+
